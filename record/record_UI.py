@@ -39,20 +39,30 @@ def audio_callback(indata, frames, time, status):
 
 def record():
     """ 녹음을 처리하는 메인 함수 """
-    with sd.InputStream(samplerate=samplerate, channels=channels, callback=audio_callback):
-        while not stop_recording.is_set():
-            sd.sleep(10)
-    save_recording()  # 녹음 중지 시 데이터 저장
+    try:
+        with sd.InputStream(samplerate=samplerate, channels=channels, callback=audio_callback):
+            while not stop_recording.is_set():
+                sd.sleep(100)
+        save_recording()  # 녹음 중지 시 데이터 저장
+    except sd.PortAudioError as e:
+        messagebox.showerror("장치 오류", "사운드 장치를 찾을 수 없습니다: " + str(e))
+        release_lock(instance_lock_file, instance_lock_handle)
+        if recording_lock_handle:
+            release_lock(recording_lock_file, recording_lock_handle)
+        sys.exit()
 
 def save_recording():
     """ 녹음된 오디오 데이터를 파일로 저장 """
-    current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = os.path.join(radio_folder, f'recording_{current_time}.wav')
-    frames = []
-    while not q.empty():
-        frames.append(q.get())
-    audio_data = np.concatenate(frames, axis=0)
-    wav.write(filename, samplerate, audio_data)
+    try:
+        current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = os.path.join(radio_folder, f'recording_{current_time}.wav')
+        frames = []
+        while not q.empty():
+            frames.append(q.get())
+        audio_data = np.concatenate(frames, axis=0)
+        wav.write(filename, samplerate, audio_data)
+    except Exception as e:
+        messagebox.showerror("파일 저장 오류", f"파일 저장 중 오류가 발생했습니다: {str(e)}")
 
 def acquire_lock(lock_file):
     """ 락 파일을 생성하여 프로세스 실행 중복을 방지 """
@@ -62,13 +72,16 @@ def acquire_lock(lock_file):
         return None
 
 def release_lock(lock_file, lock_handle):
-    """ 락 파일을 해제하고 삭제 """
+    """ 락 파일을 해제하고 삭제하며, 실패 시 에러를 출력합니다. """
+    error = False  # 에러 상태를 추적합니다.
     if lock_handle is not None:
         try:
-            os.close(lock_handle)
-            os.remove(lock_file)
+            os.close(lock_handle)  # 파일 핸들 닫기
+            os.remove(lock_file)  # 파일 삭제
         except Exception as e:
-            print(f"Error releasing lock: {e}")
+            print(f"Error releasing lock for {lock_file}: {e}")
+            error = True
+    return error
 
 def start_recording():
     """ 녹음 시작 함수 """
@@ -129,6 +142,20 @@ def update_clock():
 instance_lock_handle = acquire_lock(instance_lock_file)
 if instance_lock_handle is None:
     messagebox.showerror("Error", "실행 중 입니다.")
+    sys.exit()
+
+
+def exit_program():
+    """ 모든 락 파일을 해제하고 프로그램을 종료합니다. 실패 시 에러 메시지를 출력합니다. """
+    error_messages = []
+    if release_lock(instance_lock_file, instance_lock_handle):
+        error_messages.append(f"Failed to release instance lock: {instance_lock_file}")
+    if recording_lock_handle and release_lock(recording_lock_file, recording_lock_handle):
+        error_messages.append(f"Failed to release recording lock: {recording_lock_file}")
+
+    if error_messages:
+        error_msg = "\n".join(error_messages)
+        messagebox.showerror("Lock Release Error", error_msg)
     sys.exit()
 
 # 메인 애플리케이션 윈도우 설정
