@@ -1,14 +1,15 @@
 import tkinter as tk
 import tkinter.font as tkFont
-from tkinter import messagebox
+from tkinter import messagebox, PhotoImage
+from PIL import Image, ImageTk
 import threading
 import sounddevice as sd
 import numpy as np
-import scipy.io.wavfile as wav
 import queue
 import os
 from datetime import datetime, timedelta
 import sys
+import wave  # 파일 쓰기를 위해 필요
 
 # 녹음 설정
 samplerate = 44100  # 샘플링 레이트 설정
@@ -32,37 +33,62 @@ recording_lock_handle = None  # 녹음 락 핸들
 instance_lock_handle = None  # 인스턴스 락 핸들
 paused_time = None  # 일시 정지 시간 저장 변수
 
-def audio_callback(indata, frames, time, status):
-    """ 오디오 콜백 함수: 입력된 오디오 데이터를 큐에 저장 """
-    if not pause_recording.is_set():
-        q.put(indata.copy())
+def resource_path(relative_path):
+    """ 리소스 파일의 절대 경로를 반환합니다. """
+    try:
+        # PyInstaller가 생성한 임시 폴더에서 실행 중인지 확인합니다.
+        base_path = sys._MEIPASS
+    except Exception:
+        # 그렇지 않다면 일반적인 Python 환경에서 실행 중입니다.
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
+
+def resize_image(image_path, new_width, new_height):
+    # 수정된 경로로 이미지 파일 열기
+    adjusted_path = resource_path(image_path)
+    original_image = Image.open(adjusted_path)
+    resized_image = original_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+    return ImageTk.PhotoImage(resized_image)
+
+def reset_recording_state():
+    """ 스레드 조인 로직 조정 """
+    global recording_thread
+    stop_recording.clear()
+    pause_recording.clear()
+
+    # 스레드가 자신을 조인하지 않도록 확인
+    if threading.current_thread() != recording_thread and recording_thread.is_alive():
+        recording_thread.join()
+    release_lock(recording_lock_file, recording_lock_handle)
+    # UI 업데이트
+    app.after_cancel(update_job)
+    elapsed_time.set("녹음 진행 시간 00:00:00")
+    limit_time.set("녹음 남은 시간 01:00:00")
+    start_button.config(state=tk.NORMAL, image=record_on_button_image)
+    stop_button.config(state=tk.DISABLED, image=stop_off_button_image)
+    pause_button.config(state=tk.DISABLED, image=pause_button_image)
+    message_label.config(text="녹음을 시작해주세요.")
+
 
 def record():
     """ 녹음을 처리하는 메인 함수 """
+    current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = os.path.join(radio_folder, f'recording_{current_time}.wav')
+    wf = wave.open(filename, 'wb')
+    wf.setnchannels(channels)
+    wf.setsampwidth(np.dtype(np.int16).itemsize)  # Numpy dtype을 사용
+    wf.setframerate(samplerate)
+
     try:
-        with sd.InputStream(samplerate=samplerate, channels=channels, callback=audio_callback):
+        with sd.InputStream(samplerate=samplerate, channels=channels, dtype='int16', callback=lambda indata, frames, time, status: wf.writeframes(indata.tobytes())):
             while not stop_recording.is_set():
                 sd.sleep(100)
-        save_recording()  # 녹음 중지 시 데이터 저장
-    except sd.PortAudioError as e:
-        messagebox.showerror("장치 오류", "사운드 장치를 찾을 수 없습니다: " + str(e))
-        release_lock(instance_lock_file, instance_lock_handle)
-        if recording_lock_handle:
-            release_lock(recording_lock_file, recording_lock_handle)
-        sys.exit()
-
-def save_recording():
-    """ 녹음된 오디오 데이터를 파일로 저장 """
-    try:
-        current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = os.path.join(radio_folder, f'recording_{current_time}.wav')
-        frames = []
-        while not q.empty():
-            frames.append(q.get())
-        audio_data = np.concatenate(frames, axis=0)
-        wav.write(filename, samplerate, audio_data)
     except Exception as e:
-        messagebox.showerror("파일 저장 오류", f"파일 저장 중 오류가 발생했습니다: {str(e)}")
+        messagebox.showerror("녹음 오류", f"녹음 중 오류가 발생했습니다: {str(e)}")
+        reset_recording_state()
+    finally:
+        wf.close()
 
 def acquire_lock(lock_file):
     """ 락 파일을 생성하여 프로세스 실행 중복을 방지 """
@@ -84,33 +110,42 @@ def release_lock(lock_file, lock_handle):
     return error
 
 def start_recording():
-    """ 녹음 시작 함수 """
     global recording_lock_handle, start_time, update_job, recording_thread
-    recording_lock_handle = acquire_lock(recording_lock_file)
-    if recording_lock_handle is None:
-        messagebox.showerror("Error", "실행 중 입니다.")
-        return
+    if pause_recording.is_set():
+        # 일시 정지된 상태에서 다시 시작
+        pause_recording.clear()
+        message_label.config(text="녹음 중...")
+        start_time = datetime.now() - paused_time  # 저장된 경과 시간을 기준으로 시작 시간을 재설정
+        update_clock()  # 타이머 업데이트를 재개합니다.
+        start_button.config(state=tk.DISABLED, image=record_off_button_image)
+        stop_button.config(state=tk.NORMAL, image=stop_on_button_image)
+        pause_button.config(state=tk.NORMAL, image=pause_button_image)
+    else:
+        # 새로운 녹음 시작
+        recording_lock_handle = acquire_lock(recording_lock_file)
+        if recording_lock_handle is None:
+            messagebox.showerror("Error", "실행 중 입니다.")
+            return
+        start_time = datetime.now()
+        update_clock()
+        stop_recording.clear()
+        pause_recording.clear()
+        recording_thread = threading.Thread(target=record)
+        recording_thread.start()
+        message_label.config(text="녹음 중...")
+        start_button.config(state=tk.DISABLED,fg="black", image=record_off_button_image)
+        stop_button.config(state=tk.NORMAL, image=stop_on_button_image)
+        pause_button.config(state=tk.NORMAL, image=pause_button_image)
 
-    start_time = datetime.now()
-    update_clock()
-
-    stop_recording.clear()
-    pause_recording.clear()
-    recording_thread = threading.Thread(target=record)
-    recording_thread.start()
-    message_label.config(text="녹음 중...")
-    start_button.config(state=tk.DISABLED)
-    stop_button.config(state=tk.NORMAL)
-    pause_button.config(state=tk.NORMAL)
 
 def stop_recording_action():
     """ 녹음 중지 함수 """
     stop_recording.set()
     recording_thread.join()  # 녹음 스레드 완전히 종료 대기
 
-    start_button.config(state=tk.NORMAL)
-    stop_button.config(state=tk.DISABLED)
-    pause_button.config(state=tk.DISABLED)
+    start_button.config(state=tk.NORMAL,fg="black", image=record_on_button_image)
+    stop_button.config(state=tk.DISABLED, image=stop_off_button_image)
+    pause_button.config(state=tk.DISABLED, image=pause_button_image)
     message_label.config(text="녹음이 종료되었습니다.")
     app.after_cancel(update_job)
 
@@ -124,19 +159,33 @@ def pause_recording_action():
         message_label.config(text="녹음 일시중지")
         paused_time = datetime.now() - start_time
         app.after_cancel(update_job)
+        pause_button.config(state="disabled", image= pause_button_image)  # 일시정지 버튼 비활성화
+        start_button.config(state="normal", image= record_on_button_image)  # 녹음 시작 버튼 활성화
     else:
         pause_recording.clear()
         message_label.config(text="녹음 중...")
         start_time = datetime.now() - paused_time
         update_clock()
+        pause_button.config(state="normal", image=pause_button_image)  # 일시정지 버튼 활성화
+        start_button.config(state="disabled", image=record_off_button_image)  # 녹음 시작 버튼 비활성화
 
 def update_clock():
     """ 타이머 업데이트 함수 """
     global update_job
     now = datetime.now()
     elapsed = now - (start_time - timedelta(milliseconds=1))
-    elapsed_time.set(str(elapsed)[:-7])
+
+    limit = timedelta(seconds=duration + 1) - elapsed
+
+    if limit.total_seconds() < 0:
+        limit = timedelta(seconds=0)
+
+    elapsed_time.set("녹음 진행 시간 " + str(elapsed)[:-7])
+    limit_time.set("녹음 남은 시간 " + str(limit)[:-7])
+
     update_job = app.after(1000, update_clock)
+    if elapsed.total_seconds() >= duration:
+        stop_recording_action()
 
 # 애플리케이션 인스턴스 락 확인
 instance_lock_handle = acquire_lock(instance_lock_file)
@@ -158,36 +207,59 @@ def exit_program():
         messagebox.showerror("Lock Release Error", error_msg)
     sys.exit()
 
+def resize_image(image_path, new_width, new_height):
+    # 이미지 파일을 열고 크기를 조정합니다.
+    original_image = Image.open(image_path)
+    resized_image = original_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+    return ImageTk.PhotoImage(resized_image)
+
 # 메인 애플리케이션 윈도우 설정
 app = tk.Tk()
 app.title("녹음 프로그램")
-app.geometry("600x300")
+app.geometry("650x350")
 app.configure(bg='white')
 
+# 기존의 코드에서 이미지 로드 부분을 수정
+record_on_button_image = resize_image(resource_path("record_on.png"), 100, 100)
+record_off_button_image = resize_image(resource_path("record_off.png"), 100, 100)
+stop_on_button_image = resize_image(resource_path("stop_on.png"), 100, 100)
+stop_off_button_image = resize_image(resource_path("stop_off.png"), 100, 100)
+pause_button_image = resize_image(resource_path("pause.png"), 100, 100)
+
+
+
 custom_font = tkFont.Font(size=30, family='Helvetica')  # 사용할 폰트 설정
+custom_font_time = tkFont.Font(size=20, family='Helvetica')
 
 elapsed_time = tk.StringVar()
-elapsed_time.set("00:00:00")  # 초기 경과 시간 설정
+elapsed_time.set("녹음 진행 시간 00:00:00")  # 초기 경과 시간 설정
+
+limit_time  = tk.StringVar()
+limit_time .set("녹음 남은 시간 01:00:00") # 초기 제한 시간 설정
 
 message_label = tk.Label(app, text="녹음을 시작해주세요.", font=custom_font)
 message_label.pack(pady=10)
 
-status_label = tk.Label(app, textvariable=elapsed_time, font=custom_font)
+status_label = tk.Label(app, textvariable=limit_time, font=custom_font_time)
+status_label.pack(pady=10)
+
+status_label = tk.Label(app, textvariable=elapsed_time, font=custom_font_time)
 status_label.pack(pady=10)
 
 # 버튼 생성 및 배치
 button_frame = tk.Frame(app, bg='white')
 button_frame.pack(fill=tk.BOTH, expand=True)
 
-start_button = tk.Button(button_frame, text="▶", command=start_recording, font=custom_font, fg="black", bg="white", borderwidth=0)
-start_button.pack(side=tk.LEFT, expand=True, fill=tk.BOTH)
+start_button = tk.Button(button_frame, image=record_on_button_image, command=start_recording, font=custom_font, bg="white", borderwidth=0, state=tk.NORMAL)
+start_button.pack(side=tk.LEFT,expand=True, fill=tk.BOTH)
 
-stop_button = tk.Button(button_frame, text="■", command=stop_recording_action, font=custom_font, fg="red", bg="white", borderwidth=0, state=tk.DISABLED)
+stop_button = tk.Button(button_frame, image= stop_off_button_image, command=stop_recording_action, font=custom_font, fg="red", bg="white", borderwidth=0, state=tk.DISABLED)
 stop_button.pack(side=tk.LEFT, expand=True, fill=tk.BOTH)
 
-pause_button = tk.Button(button_frame, text="||", command=pause_recording_action, font=custom_font, fg="black", bg="white", borderwidth=0, state=tk.DISABLED)
+pause_button = tk.Button(button_frame, image=pause_button_image, command=pause_recording_action, font=custom_font, fg="black", bg="white", borderwidth=0, state=tk.DISABLED)
 pause_button.pack(side=tk.LEFT, expand=True, fill=tk.BOTH)
 
 app.mainloop()  # 애플리케이션 메인 루프
 
+release_lock(recording_lock_file, recording_lock_handle)  # 녹음 락 해제
 release_lock(instance_lock_file, instance_lock_handle)  # 인스턴스 락 해제
