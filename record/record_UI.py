@@ -5,7 +5,6 @@ from PIL import Image, ImageTk
 import threading
 import sounddevice as sd
 import numpy as np
-import queue
 import os
 from datetime import datetime, timedelta
 import sys
@@ -25,13 +24,12 @@ if not os.path.exists(radio_folder):
 instance_lock_file = os.path.join(radio_folder, 'instance.lock')
 recording_lock_file = os.path.join(radio_folder, 'recording.lock')
 
-# 녹음 데이터를 저장할 큐
-q = queue.Queue()
 stop_recording = threading.Event()  # 녹음 중지 이벤트
 pause_recording = threading.Event()  # 녹음 일시 중지 이벤트
 recording_lock_handle = None  # 녹음 락 핸들
 instance_lock_handle = None  # 인스턴스 락 핸들
 paused_time = None  # 일시 정지 시간 저장 변수
+wf = None  # 녹음 파일 핸들
 
 def resource_path(relative_path):
     """ 리소스 파일의 절대 경로를 반환합니다. """
@@ -86,6 +84,7 @@ def record():
                 sd.sleep(100)
     except Exception as e:
         messagebox.showerror("녹음 오류", f"녹음 중 오류가 발생했습니다: {str(e)}")
+        wf.close()
         reset_recording_state()
     finally:
         wf.close()
@@ -195,17 +194,36 @@ if instance_lock_handle is None:
 
 
 def exit_program():
-    """ 모든 락 파일을 해제하고 프로그램을 종료합니다. 실패 시 에러 메시지를 출력합니다. """
+    """ 프로그램을 종료하기 전에 모든 리소스가 제대로 해제되도록 깔끔하게 종료합니다. """
+    global wf
     error_messages = []
-    if release_lock(instance_lock_file, instance_lock_handle):
-        error_messages.append(f"Failed to release instance lock: {instance_lock_file}")
-    if recording_lock_handle and release_lock(recording_lock_file, recording_lock_handle):
-        error_messages.append(f"Failed to release recording lock: {recording_lock_file}")
+
+    # UI 업데이트 부분을 제외하고 녹음을 중지
+    if not stop_recording.is_set():
+        stop_recording.set()
+        if recording_thread.is_alive():
+            recording_thread.join()
+
+        # wave 파일 핸들을 닫습니다
+        if wf is not None:
+            wf.close()
+
+        release_lock(recording_lock_file, recording_lock_handle)
+
+    # 인스턴스 락 해제 시도
+    if os.path.exists(instance_lock_file):
+        if release_lock(instance_lock_file, instance_lock_handle):
+            error_messages.append(f"인스턴스 락 해제 실패: {instance_lock_file}")
 
     if error_messages:
         error_msg = "\n".join(error_messages)
         messagebox.showerror("Lock Release Error", error_msg)
-    sys.exit()
+
+    sys.exit()  # 애플리케이션을 종료합니다
+
+# 프로그램이 정상적으로 종료될 때 exit_program을 호출
+
+
 
 def resize_image(image_path, new_width, new_height):
     # 이미지 파일을 열고 크기를 조정합니다.
@@ -259,7 +277,9 @@ stop_button.pack(side=tk.LEFT, expand=True, fill=tk.BOTH)
 pause_button = tk.Button(button_frame, image=pause_button_image, command=pause_recording_action, font=custom_font, fg="black", bg="white", borderwidth=0, state=tk.DISABLED)
 pause_button.pack(side=tk.LEFT, expand=True, fill=tk.BOTH)
 
+app.protocol("WM_DELETE_WINDOW", exit_program)
+
 app.mainloop()  # 애플리케이션 메인 루프
 
-release_lock(recording_lock_file, recording_lock_handle)  # 녹음 락 해제
-release_lock(instance_lock_file, instance_lock_handle)  # 인스턴스 락 해제
+# 메인 루프가 끝나면 exit_program 호출
+exit_program()
