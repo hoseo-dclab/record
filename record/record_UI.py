@@ -7,12 +7,27 @@ import sounddevice as sd
 import numpy as np
 import os
 from datetime import datetime, timedelta
+import time
 import sys
 import wave  # 파일 쓰기를 위해 필요
 
+def get_default_input_channels():
+    """기본 오디오 입력 장치의 채널 수를 반환합니다."""
+    try:
+        # 입력 장치 정보를 조회합니다.
+        device_info = sd.query_devices(kind='input')
+        # 최대 입력 채널 수를 반환합니다.
+        return device_info['max_input_channels']
+    except Exception as e:
+        # 오디오 장치 조회 중 오류가 발생하면 사용자에게 알립니다.
+        messagebox.showerror("오디오 장치 오류", "오디오 장치를 찾을 수 없습니다: " + str(e))
+        release_lock(instance_lock_file, instance_lock_handle)
+        sys.exit()
+
+
 # 녹음 설정
 samplerate = 44100  # 샘플링 레이트 설정
-channels = 2        # 채널 수 설정 (스테레오)
+channels = get_default_input_channels()        # 채널 수 설정 (스테레오)
 duration = 3600     # 최대 녹음 시간 설정 (1시간)
 
 # 녹음 파일 저장 폴더 경로 설정
@@ -68,26 +83,23 @@ def reset_recording_state():
     pause_button.config(state=tk.DISABLED, image=pause_button_image)
     message_label.config(text="녹음을 시작해주세요.")
 
-
 def record():
-    """ 녹음을 처리하는 메인 함수 """
+    """녹음을 처리하는 메인 함수"""
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = os.path.join(radio_folder, f'recording_{current_time}.wav')
-    wf = wave.open(filename, 'wb')
-    wf.setnchannels(channels)
-    wf.setsampwidth(np.dtype(np.int16).itemsize)  # Numpy dtype을 사용
-    wf.setframerate(samplerate)
-
-    try:
-        with sd.InputStream(samplerate=samplerate, channels=channels, dtype='int16', callback=lambda indata, frames, time, status: wf.writeframes(indata.tobytes())):
+    with wave.open(filename, 'wb') as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(np.dtype(np.int16).itemsize)  # Numpy dtype을 사용
+        wf.setframerate(samplerate)
+        with sd.InputStream(samplerate=samplerate, channels=channels, dtype='int16') as stream:
             while not stop_recording.is_set():
-                sd.sleep(100)
-    except Exception as e:
-        messagebox.showerror("녹음 오류", f"녹음 중 오류가 발생했습니다: {str(e)}")
-        wf.close()
-        reset_recording_state()
-    finally:
-        wf.close()
+                if pause_recording.is_set():
+                    # 일시 정지 상태일 때 처리
+                    continue
+                # 스트림에서 데이터 읽기
+                indata, _ = stream.read(samplerate // 10)  # 약 0.1초 동안 데이터 읽기
+                wf.writeframes(indata.tobytes())
+
 
 def acquire_lock(lock_file):
     """ 락 파일을 생성하여 프로세스 실행 중복을 방지 """
@@ -156,6 +168,7 @@ def pause_recording_action():
     if not pause_recording.is_set():
         pause_recording.set()
         message_label.config(text="녹음 일시중지")
+
         paused_time = datetime.now() - start_time
         app.after_cancel(update_job)
         pause_button.config(state="disabled", image= pause_button_image)  # 일시정지 버튼 비활성화
